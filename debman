@@ -1,8 +1,8 @@
-#!/bin/bash
+#!/data/data/com.termux/files/usr/bin/bash
 # Manajemen backup & restore .deb di Termux (lokasi sdcard)
 
 CACHE_DIR="/data/data/com.termux/cache/apt/archives"
-BACKUP_DIR="/sdcard/termux-debs"
+BACKUP_DIR="/storage/0403-0201/berkas/termux-debs"
 
 mkdir -p "$BACKUP_DIR"
 
@@ -22,7 +22,7 @@ usage() {
   clean-old     → hapus versi lama di backup, simpan hanya versi terbaru
   clean-cache   → hapus semua file .deb di cache Termux
   status        → tampilkan ringkasan status cache & backup
-  help          → tampilkan pesan ini
+  help | -h     → tampilkan pesan ini
 EOF
 }
 
