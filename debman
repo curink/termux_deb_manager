@@ -1,0 +1,155 @@
+#!/bin/bash
+# Manajemen backup & restore .deb di Termux (lokasi sdcard)
+
+CACHE_DIR="/data/data/com.termux/cache/apt/archives"
+BACKUP_DIR="/sdcard/termux-debs"
+
+mkdir -p "$BACKUP_DIR"
+
+usage() {
+  cat <<EOF
+  Debman v1.0.0
+  
+  Usage: $0 {backup [pkg]|restore [pkg]|list|remove [pkg]|clean-old|clean-cache|status|help}
+
+  backup        → backup semua .deb dari cache
+  backup <pkg>  → backup hanya paket <pkg>
+  restore       → restore semua .deb dari backup
+  restore <pkg> → restore hanya paket <pkg>
+  list          → tampilkan daftar .deb di backup
+  remove        → hapus semua .deb di backup
+  remove <pkg>  → hapus semua versi .deb untuk paket <pkg>
+  clean-old     → hapus versi lama di backup, simpan hanya versi terbaru
+  clean-cache   → hapus semua file .deb di cache Termux
+  status        → tampilkan ringkasan status cache & backup
+  help          → tampilkan pesan ini
+EOF
+}
+
+backup_pkg() {
+  local pkg="$1"
+  local files=("$CACHE_DIR"/${pkg}_*.deb)
+  [ -e "${files[0]}" ] || { echo "⚠️ Tidak ada cache untuk paket: $pkg"; return; }
+
+  for deb in "${files[@]}"; do
+    echo "📥 Menyalin $deb → $BACKUP_DIR/"
+    cp -v "$deb" "$BACKUP_DIR/"
+    # auto clean versi lama
+    local base=$(basename "$deb")
+    local old=$(ls "$BACKUP_DIR"/${pkg}_*.deb 2>/dev/null | grep -v "$base")
+    if [ -n "$old" ]; then
+      echo "🗑️  Hapus versi lama untuk $pkg: $old"
+      rm -fv $old
+    fi
+  done
+}
+
+case "$1" in
+  backup)
+    if [ -n "$2" ]; then
+      echo "📦 Backup paket: $2"
+      backup_pkg "$2"
+    else
+      echo "📦 Backup semua paket dari cache: $CACHE_DIR → $BACKUP_DIR"
+      for deb in "$CACHE_DIR"/*.deb; do
+        [ -e "$deb" ] || { echo "⚠️ Tidak ada file .deb di cache"; break; }
+        pkg=$(basename "$deb" | cut -d'_' -f1)
+        backup_pkg "$pkg"
+      done
+    fi
+    echo "✅ Backup selesai."
+    ;;
+  restore)
+    if [ -n "$2" ]; then
+      echo "♻️  Restore paket: $2 dari $BACKUP_DIR"
+      dpkg -i "$BACKUP_DIR"/${2}_*.deb
+    else
+      echo "♻️  Restore semua paket dari $BACKUP_DIR"
+      dpkg -i "$BACKUP_DIR"/*.deb
+    fi
+    echo "✅ Restore selesai."
+    ;;
+  list)
+    echo "📂 Daftar file .deb di $BACKUP_DIR:"
+    ls -lh "$BACKUP_DIR"
+    ;;
+  remove)
+    if [ -n "$2" ]; then
+      echo "🗑️  Hapus semua versi $2 dari $BACKUP_DIR"
+      rm -v "$BACKUP_DIR"/${2}_*.deb 2>/dev/null || echo "⚠️ Tidak ada file untuk $2"
+    else
+      echo "🗑️  Hapus semua backup di $BACKUP_DIR"
+      rm -v "$BACKUP_DIR"/*.deb 2>/dev/null || echo "⚠️ Backup kosong"
+    fi
+    echo "✅ Remove selesai."
+    ;;
+  clean-old)
+    echo "🧹 Bersihkan versi lama di backup, sisakan versi terbaru"
+    for f in "$BACKUP_DIR"/*.deb; do
+      [ -e "$f" ] || continue
+      pkg=$(basename "$f" | cut -d'_' -f1)
+      latest=$(ls -t "$BACKUP_DIR"/${pkg}_*.deb | head -n1)
+      for old in $(ls "$BACKUP_DIR"/${pkg}_*.deb | grep -v "$latest"); do
+        echo "🗑️  Hapus versi lama: $old"
+        rm -fv "$old"
+      done
+    done
+    echo "✅ Clean-old selesai."
+    ;;
+  clean-cache)
+    echo "🧹 Bersihkan semua file .deb di cache: $CACHE_DIR"
+    rm -v "$CACHE_DIR"/*.deb 2>/dev/null || echo "⚠️ Cache kosong"
+    echo "✅ Cache dibersihkan."
+    ;;
+  status)
+    if [ -n "$2" ]; then
+      pkg="$2"
+      echo "📦 Status paket: $pkg"
+
+      # Cache
+      cache_files=$(ls "$CACHE_DIR"/${pkg}_*.deb 2>/dev/null || true)
+      if [ -n "$cache_files" ]; then
+        echo "- Cache:"
+        echo "  $(echo "$cache_files" | wc -l) versi"
+        echo "$cache_files" | xargs -n1 basename | sed 's/^/    /'
+      else
+        echo "- Cache: tidak ada"
+      fi
+
+      # Backup
+      backup_files=$(ls "$BACKUP_DIR"/${pkg}_*.deb 2>/dev/null || true)
+      if [ -n "$backup_files" ]; then
+        echo "- Backup:"
+        echo "  $(echo "$backup_files" | wc -l) versi"
+        echo "$backup_files" | xargs -n1 basename | sed 's/^/    /'
+      else
+        echo "- Backup: tidak ada"
+      fi
+    else
+      echo "📊 Status:"
+      echo "- Cache:  $(ls "$CACHE_DIR"/*.deb 2>/dev/null | wc -l) file, total $(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)"
+      if ls "$CACHE_DIR"/*.deb >/dev/null 2>&1; then
+        echo "  Paket unik (cache):"
+        for pkg in $(ls "$CACHE_DIR"/*.deb 2>/dev/null | xargs -n1 basename | cut -d'_' -f1 | sort -u); do
+          count=$(ls "$CACHE_DIR"/${pkg}_*.deb 2>/dev/null | wc -l)
+          echo "    $pkg ($count versi)"
+        done
+      fi
+
+      echo "- Backup: $(ls "$BACKUP_DIR"/*.deb 2>/dev/null | wc -l) file, total $(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1)"
+      if ls "$BACKUP_DIR"/*.deb >/dev/null 2>&1; then
+        echo "  Paket unik (backup):"
+        for pkg in $(ls "$BACKUP_DIR"/*.deb 2>/dev/null | xargs -n1 basename | cut -d'_' -f1 | sort -u); do
+          count=$(ls "$BACKUP_DIR"/${pkg}_*.deb 2>/dev/null | wc -l)
+          echo "    $pkg ($count versi)"
+        done
+      fi
+    fi
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage
+    ;;
+esac
