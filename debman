@@ -2,7 +2,7 @@
 # Manajemen backup & restore .deb di Termux (lokasi sdcard)
 
 CACHE_DIR="/data/data/com.termux/cache/apt/archives"
-BACKUP_DIR="/storage/0403-0201/berkas/termux-debs"
+BACKUP_DIR="/sdcard/termux-debs"
 
 mkdir -p "$BACKUP_DIR"
 
