@@ -1,29 +1,255 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/bin/bash
 # Manajemen backup & restore .deb di Termux (lokasi sdcard)
 
 CACHE_DIR="/data/data/com.termux/cache/apt/archives"
-BACKUP_DIR="/sdcard/termux-debs"
+BACKUP_DIR="/storage/0403-0201/berkas/termux-debs"
 
 mkdir -p "$BACKUP_DIR"
 
 usage() {
   cat <<EOF
-  Debman v1.0.0
+  Debman v1.1.0
   
-  Usage: $0 {backup [pkg]|restore [pkg]|list|remove [pkg]|clean-old|clean-cache|status|help}
+  Usage: $0 {backup [pkg]|restore [pkg...]|restore-with-deps [pkg...]|update|list|remove [pkg]|clean-old|clean-cache|status|help}
 
-  backup        → backup semua .deb dari cache
-  backup <pkg>  → backup hanya paket <pkg>
-  restore       → restore semua .deb dari backup
-  restore <pkg> → restore hanya paket <pkg>
-  list          → tampilkan daftar .deb di backup
-  remove        → hapus semua .deb di backup
-  remove <pkg>  → hapus semua versi .deb untuk paket <pkg>
-  clean-old     → hapus versi lama di backup, simpan hanya versi terbaru
-  clean-cache   → hapus semua file .deb di cache Termux
-  status        → tampilkan ringkasan status cache & backup
-  help | -h     → tampilkan pesan ini
+  backup                            → backup semua .deb dari cache
+  backup <pkg>                      → backup hanya paket <pkg>
+  restore                           → restore semua .deb dari backup
+  restore <pkg1 pkg2 ...>           → restore beberapa paket sekaligus
+  restore-with-deps <pkg1 pkg2 ...> → restore paket beserta dependensinya
+  update                            → update paket yang versi backup lebih baru
+  list                              → tampilkan daftar .deb di backup
+  remove                            → hapus semua .deb di backup
+  remove <pkg>                      → hapus semua versi .deb untuk paket <pkg>
+  clean-old                         → hapus versi lama di backup, simpan hanya versi terbaru
+  clean-cache                       → hapus semua file .deb di cache Termux
+  status                            → tampilkan ringkasan status cache & backup
+  help | -h                         → tampilkan pesan ini
 EOF
+}
+
+# Fungsi untuk mengecek apakah paket sudah terinstall
+is_installed() {
+    local pkg="$1"
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"
+    return $?
+}
+
+# Fungsi untuk mendapatkan versi paket yang terinstall
+get_installed_version() {
+    local pkg="$1"
+    dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null
+}
+
+# Fungsi untuk mendapatkan versi dari file .deb
+get_deb_version() {
+    local deb_file="$1"
+    dpkg-deb -f "$deb_file" Version 2>/dev/null
+}
+
+# Fungsi untuk membandingkan versi
+version_gt() {
+    test "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1"
+}
+
+# Fungsi untuk mendapatkan dependensi paket
+get_dependencies() {
+    local pkg="$1"
+    local deps=()
+    
+    # Dapatkan informasi dependensi dari paket .deb
+    local deb_file=$(ls "$BACKUP_DIR"/${pkg}_*.deb 2>/dev/null | head -n1)
+    
+    if [ -f "$deb_file" ]; then
+        # Ekstrak informasi dependensi menggunakan dpkg-deb
+        local depends=$(dpkg-deb -f "$deb_file" Depends 2>/dev/null || echo "")
+        
+        if [ -n "$depends" ]; then
+            # Parse dependensi (hapus versi requirements dan split by pipe/komma)
+            IFS=',' read -ra dep_list <<< "$depends"
+            for dep in "${dep_list[@]}"; do
+                # Hapus spasi di awal/akhir, dan ambil hanya nama paket (sebelum spasi pertama)
+                dep=$(echo "$dep" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | cut -d' ' -f1)
+                # Hapus karakter pipe (|) jika ada
+                dep=$(echo "$dep" | tr -d '|')
+                if [ -n "$dep" ] && [[ ! " ${deps[@]} " =~ " ${dep} " ]]; then
+                    deps+=("$dep")
+                fi
+            done
+        fi
+    fi
+    
+    echo "${deps[@]}"
+}
+
+# Fungsi recursive untuk mendapatkan semua dependensi (termasuk dependensi dari dependensi)
+get_all_dependencies() {
+    local pkg="$1"
+    local all_deps=()
+    local processed=()
+    
+    recursive_get_deps() {
+        local current_pkg="$1"
+        
+        # Cek jika paket sudah diproses
+        if [[ " ${processed[@]} " =~ " ${current_pkg} " ]]; then
+            return
+        fi
+        processed+=("$current_pkg")
+        
+        # Dapatkan dependensi langsung
+        local direct_deps=($(get_dependencies "$current_pkg"))
+        
+        for dep in "${direct_deps[@]}"; do
+            # Cek jika dependensi tersedia di backup
+            if ls "$BACKUP_DIR"/${dep}_*.deb >/dev/null 2>&1; then
+                # Tambahkan ke semua dependensi jika belum ada
+                if [[ ! " ${all_deps[@]} " =~ " ${dep} " ]]; then
+                    all_deps+=("$dep")
+                fi
+                # Rekursif dapatkan dependensi dari dependensi
+                recursive_get_deps "$dep"
+            fi
+        done
+    }
+    
+    recursive_get_deps "$pkg"
+    
+    # Hapus duplikat dan kembalikan array
+    local unique_deps=()
+    for dep in "${all_deps[@]}"; do
+        if [[ ! " ${unique_deps[@]} " =~ " ${dep} " ]]; then
+            unique_deps+=("$dep")
+        fi
+    done
+    
+    echo "${unique_deps[@]}"
+}
+
+# Fungsi untuk mendapatkan semua dependensi untuk multiple packages
+get_all_dependencies_multiple() {
+    local packages=("$@")
+    local all_deps=()
+    
+    for pkg in "${packages[@]}"; do
+        deps=($(get_all_dependencies "$pkg"))
+        all_deps+=("${deps[@]}")
+    done
+    
+    # Hapus duplikat
+    local unique_deps=()
+    for dep in "${all_deps[@]}"; do
+        if [[ ! " ${unique_deps[@]} " =~ " ${dep} " ]] && [[ ! " ${packages[@]} " =~ " ${dep} " ]]; then
+            unique_deps+=("$dep")
+        fi
+    done
+    
+    echo "${unique_deps[@]}"
+}
+
+# Fungsi untuk mendapatkan urutan install yang benar (dependensi pertama)
+get_install_order() {
+    local packages=("$@")
+    local install_order=()
+    local processed=()
+    
+    # Fungsi recursive untuk menentukan urutan
+    resolve_deps() {
+        local pkg="$1"
+        
+        # Cek jika paket sudah diproses
+        if [[ " ${processed[@]} " =~ " ${pkg} " ]]; then
+            return
+        fi
+        processed+=("$pkg")
+        
+        # Dapatkan dependensi paket ini
+        local deps=($(get_dependencies "$pkg"))
+        
+        # Process dependencies first
+        for dep in "${deps[@]}"; do
+            # Cek jika dependensi ada dalam daftar packages dan tersedia di backup
+            if [[ " ${packages[@]} " =~ " ${dep} " ]] && ls "$BACKUP_DIR"/${dep}_*.deb >/dev/null 2>&1; then
+                resolve_deps "$dep"
+            fi
+        done
+        
+        # Tambahkan paket ke urutan install setelah dependensinya
+        if [[ ! " ${install_order[@]} " =~ " ${pkg} " ]]; then
+            install_order+=("$pkg")
+        fi
+    }
+    
+    # Process semua packages
+    for pkg in "${packages[@]}"; do
+        resolve_deps "$pkg"
+    done
+    
+    echo "${install_order[@]}"
+}
+
+# Fungsi untuk install paket hanya jika belum terinstall atau versi berbeda
+install_if_needed() {
+    local pkg="$1"
+    local deb_file=$(ls "$BACKUP_DIR"/${pkg}_*.deb 2>/dev/null | head -n1)
+    
+    if [ ! -f "$deb_file" ]; then
+        echo "⚠️ File .deb tidak ditemukan untuk paket: $pkg"
+        return 1
+    fi
+    
+    local deb_version=$(get_deb_version "$deb_file")
+    
+    if is_installed "$pkg"; then
+        local installed_version=$(get_installed_version "$pkg")
+        
+        if [ "$installed_version" = "$deb_version" ]; then
+            echo "✓ $pkg (v$installed_version) sudah terinstall, dilewati"
+            return 0
+        else
+            echo "🔄 $pkg versi berbeda: terinstall v$installed_version, backup v$deb_version"
+            echo "📥 Upgrade: $pkg"
+            dpkg -i "$deb_file"
+            return $?
+        fi
+    else
+        echo "📥 Install: $pkg (v$deb_version)"
+        dpkg -i "$deb_file"
+        return $?
+    fi
+}
+
+# Fungsi untuk update paket jika versi backup lebih baru
+update_if_newer() {
+    local pkg="$1"
+    local deb_file=$(ls "$BACKUP_DIR"/${pkg}_*.deb 2>/dev/null | head -n1)
+    
+    if [ ! -f "$deb_file" ]; then
+        echo "⚠️ File .deb tidak ditemukan untuk paket: $pkg"
+        return 1
+    fi
+    
+    local deb_version=$(get_deb_version "$deb_file")
+    
+    if is_installed "$pkg"; then
+        local installed_version=$(get_installed_version "$pkg")
+        
+        if [ "$installed_version" = "$deb_version" ]; then
+            echo "✓ $pkg (v$installed_version) sudah versi terbaru"
+            return 0
+        elif version_gt "$deb_version" "$installed_version"; then
+            echo "🔄 $pkg versi lebih baru tersedia: terinstall v$installed_version, backup v$deb_version"
+            echo "📥 Upgrade: $pkg"
+            dpkg -i "$deb_file"
+            return $?
+        else
+            echo "ℹ️  $pkg versi backup lebih lama: terinstall v$installed_version, backup v$deb_version (dilewati)"
+            return 0
+        fi
+    else
+        echo "ℹ️  $pkg belum terinstall, gunakan restore untuk install"
+        return 1
+    fi
 }
 
 backup_pkg() {
@@ -60,14 +286,82 @@ case "$1" in
     echo "✅ Backup selesai."
     ;;
   restore)
-    if [ -n "$2" ]; then
-      echo "♻️  Restore paket: $2 dari $BACKUP_DIR"
-      dpkg -i "$BACKUP_DIR"/${2}_*.deb
-    else
+    shift
+    if [ $# -eq 0 ]; then
       echo "♻️  Restore semua paket dari $BACKUP_DIR"
-      dpkg -i "$BACKUP_DIR"/*.deb
+      for deb in "$BACKUP_DIR"/*.deb; do
+        [ -e "$deb" ] || { echo "⚠️ Tidak ada file .deb di backup"; break; }
+        pkg=$(basename "$deb" | cut -d'_' -f1)
+        install_if_needed "$pkg"
+      done
+    else
+      echo "♻️  Restore paket: $@ dari $BACKUP_DIR"
+      for pkg in "$@"; do
+        install_if_needed "$pkg"
+      done
     fi
     echo "✅ Restore selesai."
+    ;;
+  restore-with-deps)
+    shift
+    if [ $# -eq 0 ]; then
+      echo "❌ Usage: $0 restore-with-deps <package1> [package2 ...]"
+      exit 1
+    fi
+    
+    echo "♻️  Restore paket $@ beserta dependensinya"
+    
+    # Dapatkan semua dependensi (termasuk dependensi dari dependensi)
+    echo "🔍 Mencari dependensi untuk $@..."
+    all_deps=($(get_all_dependencies_multiple "$@"))
+    
+    # Tambahkan paket utama ke daftar
+    all_packages=("${all_deps[@]}" "$@")
+    
+    if [ ${#all_deps[@]} -gt 0 ]; then
+        echo "📦 Semua dependensi yang ditemukan: ${all_deps[*]}"
+        
+        # Dapatkan urutan install yang benar (dependensi pertama)
+        echo "🔧 Menentukan urutan install..."
+        install_order=($(get_install_order "${all_packages[@]}"))
+        
+        echo "📋 Urutan install: ${install_order[*]}"
+        
+        # Install semua paket dalam urutan yang benar
+        for pkg in "${install_order[@]}"; do
+            install_if_needed "$pkg"
+        done
+    else
+        echo "ℹ️  Tidak ada dependensi yang ditemukan di backup"
+        # Install hanya paket utama
+        for pkg in "$@"; do
+            install_if_needed "$pkg"
+        done
+    fi
+    echo "✅ Restore dengan dependensi selesai."
+    ;;
+  update)
+    shift
+    echo "🔄 Update paket yang versi backup lebih baru"
+    
+    if [ $# -eq 0 ]; then
+        # Update semua paket yang ada di backup
+        updated_count=0
+        for deb in "$BACKUP_DIR"/*.deb; do
+            [ -e "$deb" ] || { echo "⚠️ Tidak ada file .deb di backup"; break; }
+            pkg=$(basename "$deb" | cut -d'_' -f1)
+            if update_if_newer "$pkg"; then
+                updated_count=$((updated_count + 1))
+            fi
+        done
+        echo "✅ Update selesai. $updated_count paket diperiksa."
+    else
+        # Update paket tertentu
+        for pkg in "$@"; do
+            update_if_newer "$pkg"
+        done
+        echo "✅ Update selesai."
+    fi
     ;;
   list)
     echo "📂 Daftar file .deb di $BACKUP_DIR:"
@@ -122,8 +416,73 @@ case "$1" in
         echo "- Backup:"
         echo "  $(echo "$backup_files" | wc -l) versi"
         echo "$backup_files" | xargs -n1 basename | sed 's/^/    /'
+        
+        # Status install
+        if is_installed "$pkg"; then
+            installed_version=$(get_installed_version "$pkg")
+            latest_deb=$(ls "$BACKUP_DIR"/${pkg}_*.deb 2>/dev/null | head -n1)
+            if [ -f "$latest_deb" ]; then
+                deb_version=$(get_deb_version "$latest_deb")
+                if [ "$installed_version" = "$deb_version" ]; then
+                    echo "- Status: ✓ Terinstall (v$installed_version) - Versi terbaru"
+                elif version_gt "$deb_version" "$installed_version"; then
+                    echo "- Status: ⚠️ Terinstall (v$installed_version) - Versi baru tersedia: v$deb_version"
+                else
+                    echo "- Status: ✓ Terinstall (v$installed_version) - Versi backup lebih lama: v$deb_version"
+                fi
+            else
+                echo "- Status: ✓ Terinstall (v$installed_version)"
+            fi
+        else
+            echo "- Status: ✗ Belum terinstall"
+        fi
+        
+        # Tampilkan dependensi jika ada
+        echo "- Dependensi (jika ada di backup):"
+        deps=($(get_dependencies "$pkg"))
+        if [ ${#deps[@]} -gt 0 ]; then
+            for dep in "${deps[@]}"; do
+                if ls "$BACKUP_DIR"/${dep}_*.deb >/dev/null 2>&1; then
+                    if is_installed "$dep"; then
+                        echo "  ✓ $dep (tersedia, terinstall)"
+                    else
+                        echo "  ✓ $dep (tersedia, belum terinstall)"
+                    fi
+                else
+                    echo "  ✗ $dep (tidak tersedia)"
+                fi
+            done
+        else
+            echo "  Tidak ada dependensi yang tercatat"
+        fi
+        
+        # Tampilkan dependensi nested jika ada
+        echo "- Dependensi bersarang (jika ada di backup):"
+        nested_deps=($(get_all_dependencies "$pkg"))
+        if [ ${#nested_deps[@]} -gt 0 ]; then
+            for dep in "${nested_deps[@]}"; do
+                if ls "$BACKUP_DIR"/${dep}_*.deb >/dev/null 2>&1; then
+                    if is_installed "$dep"; then
+                        echo "  ↳ ✓ $dep (tersedia, terinstall)"
+                    else
+                        echo "  ↳ ✓ $dep (tersedia, belum terinstall)"
+                    fi
+                else
+                    echo "  ↳ ✗ $dep (tidak tersedia)"
+                fi
+            done
+        else
+            echo "  Tidak ada dependensi bersarang"
+        fi
       else
         echo "- Backup: tidak ada"
+        # Status install meski tidak ada backup
+        if is_installed "$pkg"; then
+            installed_version=$(get_installed_version "$pkg")
+            echo "- Status: ✓ Terinstall (v$installed_version) [tidak ada backup]"
+        else
+            echo "- Status: ✗ Belum terinstall"
+        fi
       fi
     else
       echo "📊 Status:"
@@ -141,7 +500,24 @@ case "$1" in
         echo "  Paket unik (backup):"
         for pkg in $(ls "$BACKUP_DIR"/*.deb 2>/dev/null | xargs -n1 basename | cut -d'_' -f1 | sort -u); do
           count=$(ls "$BACKUP_DIR"/${pkg}_*.deb 2>/dev/null | wc -l)
-          echo "    $pkg ($count versi)"
+          if is_installed "$pkg"; then
+              installed_ver=$(get_installed_version "$pkg")
+              latest_deb=$(ls "$BACKUP_DIR"/${pkg}_*.deb 2>/dev/null | head -n1)
+              if [ -f "$latest_deb" ]; then
+                  deb_ver=$(get_deb_version "$latest_deb")
+                  if [ "$installed_ver" = "$deb_ver" ]; then
+                      echo "    $pkg ($count versi) ✓"
+                  elif version_gt "$deb_ver" "$installed_ver"; then
+                      echo "    $pkg ($count versi) ⚠️ (v$installed_ver -> v$deb_ver)"
+                  else
+                      echo "    $pkg ($count versi) ✓ (v$installed_ver, backup v$deb_ver)"
+                  fi
+              else
+                  echo "    $pkg ($count versi) ✓"
+              fi
+          else
+              echo "    $pkg ($count versi) ✗"
+          fi
         done
       fi
     fi
